@@ -3,10 +3,10 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <unordered_set>
-#include <vector>
 #include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 
 namespace po = boost::program_options;
@@ -25,6 +25,192 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int UNRECOGNIZED_ARGUMENTS;
+}
+
+namespace
+{
+
+struct ParsedOptions
+{
+    po::parsed_options options;
+    std::vector<const OptionsAliasParser::Option *> descriptors;
+};
+
+ParsedOptions
+parseOptions(const std::vector<std::string> & arguments, const po::options_description & description, const OptionsAliasParser & aliases)
+{
+    ParsedOptions result{po::parsed_options(&description, po::command_line_style::allow_long), {}};
+    result.options.options.reserve(arguments.size());
+    result.descriptors.reserve(arguments.size());
+
+    size_t argument_index = !arguments.empty() && arguments.front().empty() ? 1 : 0;
+    int position_index = 0;
+    std::string option_name;
+    std::string original_token;
+
+    const auto append_positional = [&](const std::string & argument)
+    {
+        po::option option;
+        option.position_key = position_index++;
+        option.value.push_back(argument);
+        option.original_tokens.push_back(argument);
+        result.options.options.push_back(std::move(option));
+        result.descriptors.push_back(nullptr);
+    };
+
+    const auto append_option = [&](po::option option, const OptionsAliasParser::Option * descriptor)
+    {
+        if (descriptor)
+        {
+            option.string_key = (*descriptor)->key(option.string_key);
+            option_name = option.string_key;
+            const auto semantic = (*descriptor)->semantic();
+            const auto min_tokens = semantic->min_tokens();
+            const auto max_tokens = semantic->max_tokens();
+            if (option.value.size() > max_tokens)
+                throw po::invalid_command_line_syntax(po::invalid_syntax::extra_parameter);
+
+            while (option.value.size() < max_tokens && argument_index < arguments.size())
+            {
+                const auto & value = arguments[argument_index];
+                if (value.size() > 1 && value.starts_with('-'))
+                {
+                    if (option.value.size() >= min_tokens)
+                        break;
+                    original_token = value;
+                    if (aliases.findOption(value, false))
+                        throw po::invalid_command_line_syntax(po::invalid_syntax::missing_parameter);
+                }
+                option.value.push_back(value);
+                option.original_tokens.push_back(value);
+                ++argument_index;
+            }
+
+            if (option.value.size() < min_tokens)
+                throw po::invalid_command_line_syntax(po::invalid_syntax::missing_parameter);
+        }
+        else
+            option.unregistered = true;
+
+        result.options.options.push_back(std::move(option));
+        result.descriptors.push_back(descriptor);
+    };
+
+    while (argument_index < arguments.size())
+    {
+        const auto & argument = arguments[argument_index++];
+        if (argument == "--")
+        {
+            while (argument_index < arguments.size())
+                append_positional(arguments[argument_index++]);
+            break;
+        }
+        if (argument.size() < 2 || !argument.starts_with('-'))
+        {
+            append_positional(argument);
+            continue;
+        }
+
+        original_token = argument;
+        try
+        {
+            if (argument.starts_with("--"))
+            {
+                const auto equals = argument.find('=');
+                option_name = argument.substr(2, equals == std::string::npos ? equals : equals - 2);
+                const auto alias = aliases(argument);
+                if (!alias.first.empty())
+                    option_name = alias.first;
+                else if (equals != std::string::npos && equals + 1 == argument.size())
+                    throw po::invalid_command_line_syntax(po::invalid_syntax::empty_adjacent_parameter);
+
+                po::option option;
+                option.string_key = option_name;
+                option.original_tokens.push_back(argument);
+                if (equals != std::string::npos && equals + 1 < argument.size())
+                    option.value.push_back(argument.substr(equals + 1));
+                if (option_name.empty())
+                {
+                    option.position_key = position_index++;
+                    result.options.options.push_back(std::move(option));
+                    result.descriptors.push_back(nullptr);
+                    continue;
+                }
+                const auto * descriptor = aliases.findOption(option_name);
+                append_option(std::move(option), descriptor);
+            }
+            else
+            {
+                for (size_t short_index = 1; short_index < argument.size(); ++short_index)
+                {
+                    option_name = std::string("-") + argument[short_index];
+                    const auto * descriptor = aliases.findOption(option_name, false);
+                    po::option option;
+                    option.string_key = option_name;
+                    const bool grouped = descriptor && (*descriptor)->semantic()->max_tokens() == 0 && short_index + 1 < argument.size();
+                    if (!grouped)
+                    {
+                        option.original_tokens.push_back(argument);
+                        if (short_index + 1 < argument.size())
+                            option.value.push_back(argument.substr(short_index + 1));
+                    }
+                    append_option(std::move(option), descriptor);
+                    if (!grouped)
+                        break;
+                }
+            }
+        }
+        catch (po::error_with_option_name & exception)
+        {
+            exception.add_context(option_name, original_token, result.options.m_options_prefix);
+            throw;
+        }
+    }
+
+    return result;
+}
+
+void storeOptions(const ParsedOptions & parsed_options, po::variables_map & options)
+{
+    const auto & [parsed, descriptors] = parsed_options;
+    std::unordered_set<std::string_view> stored;
+    stored.reserve(parsed.options.size());
+
+    for (size_t option_index = 0; option_index < parsed.options.size(); ++option_index)
+    {
+        const auto & option = parsed.options[option_index];
+        const auto * descriptor = descriptors[option_index];
+        if (!descriptor)
+            continue;
+
+        if (stored.insert(option.string_key).second)
+        {
+            po::options_description single_description;
+            single_description.add(*descriptor);
+            po::parsed_options single_option(&single_description, parsed.m_options_prefix);
+            single_option.options.push_back(option);
+            po::store(single_option, options);
+        }
+        else
+        {
+            try
+            {
+                (*descriptor)->semantic()->parse(options.find(option.string_key)->second.value(), option.value, false);
+            }
+            catch (po::error_with_option_name & exception)
+            {
+                exception.add_context(
+                    option.string_key,
+                    option.original_tokens.empty() ? std::string{} : option.original_tokens.front(),
+                    parsed.m_options_prefix);
+                throw;
+            }
+        }
+    }
+
+    po::store(po::parsed_options(parsed.description, parsed.m_options_prefix), options);
+}
+
 }
 
 void ClientApplicationBase::parseAndCheckOptions(OptionsDescription & options_description, po::variables_map & options, Arguments & arguments)
@@ -76,11 +262,10 @@ void ClientApplicationBase::parseAndCheckOptions(OptionsDescription & options_de
     }
 
     /// Parse main commandline options.
-    auto parser = po::command_line_parser(arguments)
-                      .options(options_description.main_description.value())
-                      .extra_parser(OptionsAliasParser(options_description.main_description.value()))
-                      .allow_unregistered();
-    po::parsed_options parsed = parser.run();
+    const auto & description = options_description.main_description.value();
+    const OptionsAliasParser aliases(description);
+    const auto parsed_options = parseOptions(arguments, description, aliases);
+    const auto & parsed = parsed_options.options;
 
     /// Check unrecognized options without positional options.
     auto unrecognized_options = po::collect_unrecognized(parsed.options, po::collect_unrecognized_mode::exclude_positional);
@@ -134,14 +319,77 @@ void ClientApplicationBase::parseAndCheckOptions(OptionsDescription & options_de
         }
     }
 
-    po::store(parsed, options);
+    storeOptions(parsed_options, options);
 }
 
 OptionsAliasParser::OptionsAliasParser(const boost::program_options::options_description & options)
 {
     options_names.reserve(options.options().size());
+    long_option_names.reserve(options.options().size());
     for (const auto & option : options.options())
-        options_names.insert(option->long_name());
+    {
+        const auto add_name = [&](const std::string & name, bool is_primary)
+        {
+            if (name.empty())
+                return;
+
+            auto [iterator, inserted] = options_names.emplace(name, IndexedOption{&option, is_primary});
+            if (!inserted)
+            {
+                iterator->second.is_primary |= is_primary;
+                if (iterator->second.option != &option)
+                    iterator->second.option = nullptr;
+            }
+        };
+
+        const auto names = option->long_names();
+        for (size_t name_index = 0; name_index < names.second; ++name_index)
+        {
+            add_name(names.first[name_index], names.first[name_index] == option->long_name());
+            if (!names.first[name_index].empty())
+                long_option_names.emplace_back(names.first[name_index], &option);
+        }
+
+        const auto short_name = option->canonical_display_name(po::command_line_style::allow_dash_for_short);
+        if (short_name.size() == 2 && short_name[0] == '-')
+            add_name(short_name, false);
+    }
+}
+
+const OptionsAliasParser::Option * OptionsAliasParser::findOption(std::string_view name, bool allow_prefix) const
+{
+    const auto iterator = options_names.find(name);
+    if (iterator != options_names.end())
+    {
+        if (!iterator->second.option)
+            throw po::ambiguous_option({std::string(name), std::string(name)});
+        return iterator->second.option;
+    }
+    if (!allow_prefix)
+        return nullptr;
+
+    if (!long_option_names_sorted)
+    {
+        std::ranges::sort(long_option_names, {}, &NamedOption::first);
+        long_option_names_sorted = true;
+    }
+
+    std::unordered_set<const Option *> matches;
+    std::vector<std::string> alternatives;
+    const Option * matched = nullptr;
+    for (auto candidate = std::ranges::lower_bound(long_option_names, name, {}, &NamedOption::first);
+         candidate != long_option_names.end() && candidate->first.starts_with(name);
+         ++candidate)
+    {
+        if (matches.insert(candidate->second).second)
+        {
+            matched = candidate->second;
+            alternatives.push_back((*matched)->key(std::string(name)));
+        }
+    }
+    if (alternatives.size() > 1)
+        throw po::ambiguous_option(alternatives);
+    return matched;
 }
 
 std::pair<std::string, std::string> OptionsAliasParser::operator()(const std::string & token) const
@@ -154,12 +402,12 @@ std::pair<std::string, std::string> OptionsAliasParser::operator()(const std::st
     auto pos_eq = arg.find('=');
     std::string key = arg.substr(0, pos_eq);
 
-    if (options_names.contains(key))
+    if (auto iterator = options_names.find(key); iterator != options_names.end() && iterator->second.is_primary)
         // option does not require any changes, because it is already correct
         return {};
 
     std::replace(key.begin(), key.end(), '-', '_');
-    if (!options_names.contains(key))
+    if (auto iterator = options_names.find(key); iterator == options_names.end() || !iterator->second.is_primary)
         // after replacing '-' with '_' argument is still unknown
         return {};
 
